@@ -10,24 +10,39 @@ from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 
 
+# ------------------------------------------------------------
+# Genel ayarlar
+# ------------------------------------------------------------
 st.set_page_config(
     page_title="BG-EAF Arc Optimizer",
     layout="wide",
 )
 
+
+# ------------------------------------------------------------
+# Yardımcı fonksiyonlar
+# ------------------------------------------------------------
 @st.cache_data
 def load_csv(file_bytes: bytes) -> pd.DataFrame:
     return pd.read_csv(io.BytesIO(file_bytes))
 
+
 def add_panel_cooling_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Panel soğutma kolonları varsa panel_Q_kW feature'ını ekler.
+    Beklenen kolonlar:
+        panel_T_in_C, panel_T_out_C, panel_flow_kg_s
+    """
     required = ["panel_T_in_C", "panel_T_out_C", "panel_flow_kg_s"]
     if all(c in df.columns for c in required):
         if "panel_Q_kW" not in df.columns:
             df = df.copy()
-            cp_kJ = 4.18
+            cp_kJ = 4.18  # su için yaklaşık özgül ısı (kJ/kgK)
             dT = df["panel_T_out_C"] - df["panel_T_in_C"]
+            # flow (kg/s) * cp (kJ/kgK) * dT (K) ~ kW
             df["panel_Q_kW"] = df["panel_flow_kg_s"] * cp_kJ * dT
     return df
+
 
 def split_features_target(
     df: pd.DataFrame, target_col: str
@@ -36,6 +51,7 @@ def split_features_target(
     X = df[feature_cols].values
     y = df[target_col].values
     return X, y, feature_cols
+
 
 def train_rf_model(
     X: np.ndarray,
@@ -72,6 +88,7 @@ def train_rf_model(
         "metrics": metrics,
     }
 
+
 def ensure_session_keys():
     if "raw_df" not in st.session_state:
         st.session_state["raw_df"] = None
@@ -82,11 +99,13 @@ def ensure_session_keys():
     if "target_col" not in st.session_state:
         st.session_state["target_col"] = None
 
+
 def set_model(model, feature_cols: List[str], target_col: str, metrics: Dict):
     st.session_state["trained_model"] = model
     st.session_state["feature_cols"] = feature_cols
     st.session_state["target_col"] = target_col
     st.session_state["model_metrics"] = metrics
+
 
 def get_model():
     return (
@@ -96,6 +115,8 @@ def get_model():
         st.session_state.get("model_metrics"),
     )
 
+
+# ---------- CFD DEMO FONKSİYONU ---------------------------------
 @st.cache_data
 def generate_cfd_fields(
     power_kWh: float,
@@ -105,30 +126,42 @@ def generate_cfd_fields(
     nx: int = 80,
     ny: int = 80,
 ):
+    """
+    Gerçek CFD değil; EAF içi sıcaklık + hız alanına benzeyen sentetik bir alan üretir.
+    """
     x = np.linspace(-1.0, 1.0, nx)
     y = np.linspace(0.0, 2.0, ny)
     X, Y = np.meshgrid(x, y)
 
+    # Arkın merkezi ve yarıçapı
     r = np.sqrt(X**2 + (Y - 1.4) ** 2)
 
+    # Güce göre temel sıcaklık seviyesi
     base_T = 1580 + (power_kWh - 4000) * 0.03 + (oxygen_Nm3 - 180) * 0.4
     core_T = base_T + 80
 
+    # Çekirdek: merkezde sıcaklık yüksek, r ile azalan Gauss
     T = core_T * np.exp(-(r / 0.45) ** 2) + base_T - 60
 
+    # Tap süresi uzadıkça homojenleşme (gradient azalıyor)
     hom_factor = np.clip((tap_time_min - 45) / 20, 0.0, 1.0)
     T = base_T + (T - base_T) * (1.0 - 0.4 * hom_factor)
 
+    # Slag köpüğü, üst bölgede ısı kaybını azaltır
     slag_height = 1.3 + slag_foam_level * 0.3
     foam_mask = Y >= slag_height
     T = np.where(foam_mask, T + 20 * slag_foam_level, T)
 
+    # Basit swirl akış (sanki manyetik karıştırma varmış gibi)
     U = -(Y - 1.0)
     V = X
     vel_mag = np.sqrt(U**2 + V**2)
+
+    # Oksijen arttıkça türbülans (swirl) bir miktar artıyor
     vel_mag *= 0.6 + (oxygen_Nm3 - 170) * 0.01
 
     return X, Y, T, vel_mag, slag_height
+
 
 def ensure_cfd_defaults():
     if "cfd_power" not in st.session_state:
@@ -140,6 +173,10 @@ def ensure_cfd_defaults():
     if "cfd_slag_foam" not in st.session_state:
         st.session_state["cfd_slag_foam"] = 0.5
 
+
+# ------------------------------------------------------------
+# Sidebar
+# ------------------------------------------------------------
 ensure_session_keys()
 
 st.sidebar.title("BG-EAF Arc Optimizer")
@@ -157,10 +194,14 @@ page = st.sidebar.radio(
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
-    "EAF verisi üzerinden enerji / süre / sıcaklık tahmini, "
+    "EAF / pota ocağı verisi üzerinden enerji / süre / sıcaklık tahmini, "
     "panel soğutma feature'ları ve demo CFD görselleştirmesi."
 )
 
+
+# ------------------------------------------------------------
+# 1) Veri Yükleme & Keşif
+# ------------------------------------------------------------
 if page.startswith("1"):
     st.title("1) Veri Yükleme & Keşif")
 
@@ -171,11 +212,12 @@ if page.startswith("1"):
 
     if uploaded is not None:
         df = load_csv(uploaded.getvalue())
+        # Panel soğutma feature'ını otomatik ekle
         df = add_panel_cooling_features(df)
         st.session_state["raw_df"] = df
 
         st.success(
-            f"{uploaded.name} yüklendi – satır: {df.shape[0]}, kolon: {df.shape[1]}"
+            f"**{uploaded.name}** yüklendi – satır: {df.shape[0]}, kolon: {df.shape[1]}"
         )
 
         tab1, tab2, tab3 = st.tabs(["Örnek Satırlar", "Kolon Bilgisi", "İstatistikler"])
@@ -200,9 +242,9 @@ if page.startswith("1"):
             st.dataframe(df.describe(include="all").transpose())
 
         st.info(
-            "Sonraki adımda bir hedef kolon (ör. tap_time_min, tap_temperature_C, "
-            "melt_temperature_C) seçerek model eğiteceğiz. Panel soğutma kolonları "
-            "mevcutsa panel_Q_kW feature'ı otomatik hesaplanır."
+            "Sonraki adımda bir **hedef kolon** seçerek (ör. `tap_time_min`, "
+            "`tap_temperature_C`, `melt_temperature_C`) model eğiteceğiz.\n\n"
+            "Panel soğutma kolonları mevcutsa, `panel_Q_kW` feature'ı otomatik hesaplanır."
         )
     else:
         if st.session_state["raw_df"] is None:
@@ -210,21 +252,28 @@ if page.startswith("1"):
         else:
             st.info("Mevcut veri seti session'da yüklü. Diğer menülerden devam edebilirsin.")
 
+
+# ------------------------------------------------------------
+# 2) Model Eğitimi
+# ------------------------------------------------------------
 elif page.startswith("2"):
     st.title("2) Model Eğitimi")
 
     df = st.session_state.get("raw_df")
 
     if df is None:
-        st.warning("Önce 1) Veri Yükleme & Keşif sekmesinden CSV yüklemen gerekiyor.")
+        st.warning("Önce **1) Veri Yükleme & Keşif** sekmesinden CSV yüklemen gerekiyor.")
     else:
+        # Panel soğutma feature'ı yoksa burada da eklemeyi dene
         df = add_panel_cooling_features(df)
         st.session_state["raw_df"] = df
 
         numeric_cols = df.select_dtypes(include=["int64", "float64"]).columns.tolist()
 
         if not numeric_cols:
-            st.error("Sayısal kolon bulunamadı.")
+            st.error(
+                "Sayısal kolon bulunamadı. Model için en az bir sayısal kolon gerekli."
+            )
         else:
             st.write("Veri boyutu:", df.shape)
             st.write("Sayısal kolonlar:", numeric_cols)
@@ -236,7 +285,7 @@ elif page.startswith("2"):
 
             default_features = [c for c in numeric_cols if c != target_col]
             feature_cols = st.multiselect(
-                "Girdi (feature) kolonlar:",
+                "Girdi (feature) kolonlar (hurda, enerji, sıcaklık, panel_Q_kW vb.):",
                 options=numeric_cols,
                 default=default_features,
             )
@@ -277,33 +326,45 @@ elif page.startswith("2"):
                         set_model(model, feature_cols, target_col, metrics)
 
                     st.success("Model başarıyla eğitildi.")
-                    st.subheader("Performans Metrikleri")
+                    st.subheader("Performans Metri̇kleri")
                     col1, col2, col3, col4 = st.columns(4)
                     col1.metric("MAE", f"{metrics['MAE']:.3f}")
                     col2.metric("RMSE", f"{metrics['RMSE']:.3f}")
                     col3.metric("R2", f"{metrics['R2']:.3f}")
                     col4.metric("MSE", f"{metrics['MSE']:.3f}")
 
+                    st.caption(
+                        "Not: Bu metrikler seçilen veri alt kümesi, feature set ve "
+                        "train/test oranına göre hesaplanmıştır."
+                    )
+
             model, fcols, tcol, m = get_model()
             if model is not None:
                 st.markdown("---")
                 st.subheader("Mevcut Model Özeti")
-                st.write("Hedef kolon:", f"{tcol}")
+                st.write("Hedef kolon:", f"`{tcol}`")
                 st.write("Feature kolonlar:", fcols)
                 if m:
                     st.write("Son eğitim metrikleri:", m)
 
+
+# ------------------------------------------------------------
+# 3) Tek Heat Tahmini
+# ------------------------------------------------------------
 elif page.startswith("3"):
     st.title("3) Tek Heat Tahmini")
 
     model, feature_cols, target_col, metrics = get_model()
 
     if model is None or feature_cols is None or target_col is None:
-        st.warning("Önce 2) Model Eğitimi sekmesinden bir model eğitmen gerekiyor.")
+        st.warning(
+            "Önce **2) Model Eğitimi** sekmesinden bir model eğitmen gerekiyor."
+        )
     else:
         st.info(
-            f"Mevcut model, {target_col} değerini tahmin ediyor. "
-            "Aşağıya yeni bir heat için proses değerlerini girerek tahmini görebilirsin."
+            f"Mevcut model, **{target_col}** değerini tahmin ediyor. "
+            "Aşağıya yeni bir heat için proses değerlerini girerek "
+            "tahmini görebilirsin."
         )
 
         cols_per_row = 3
@@ -324,15 +385,27 @@ elif page.startswith("3"):
         if st.button("Tahmini Hesapla"):
             arr = np.array(input_values, dtype=float).reshape(1, -1)
             pred = float(model.predict(arr)[0])
-            st.success(f"Tahmin edilen {target_col}: {pred:.3f}")
+            st.success(f"Tahmin edilen **{target_col}**: `{pred:.3f}`")
 
+            if metrics:
+                st.caption(
+                    f"Bu tahmin, R2={metrics['R2']:.3f} seviyesinde doğruluğa sahip "
+                    "bir Random Forest modeli ile üretilmiştir."
+                )
+
+
+# ------------------------------------------------------------
+# 4) Batch Tahmin (CSV)
+# ------------------------------------------------------------
 elif page.startswith("4"):
     st.title("4) Batch Tahmin (CSV)")
 
     model, feature_cols, target_col, metrics = get_model()
 
     if model is None or feature_cols is None or target_col is None:
-        st.warning("Önce 2) Model Eğitimi sekmesinden bir model eğitmen gerekiyor.")
+        st.warning(
+            "Önce **2) Model Eğitimi** sekmesinden bir model eğitmen gerekiyor."
+        )
     else:
         st.info(
             "Feature kolonları içeren bir CSV yükleyerek toplu tahmin alabilirsin. "
@@ -347,7 +420,9 @@ elif page.startswith("4"):
 
             missing_cols = [c for c in feature_cols if c not in batch_df.columns]
             if missing_cols:
-             st.error(f"Yüklenen dosyada aşağıdaki zorunlu kolonlar eksik: {', '.join(missing_cols)}")
+                missing_text = ", ".join(missing_cols)
+                st.error(
+                    f"Yüklenen dosyada aşağıdaki zorunlu kolonlar eksik: {missing_text}"
                 )
             else:
                 features = batch_df[feature_cols].values
@@ -368,6 +443,16 @@ elif page.startswith("4"):
                     mime="text/csv",
                 )
 
+                if metrics:
+                    st.caption(
+                        f"Tahminler, R2={metrics['R2']:.3f} seviyesinde doğruluğa sahip "
+                        "bir Random Forest modeli ile üretilmiştir."
+                    )
+
+
+# ------------------------------------------------------------
+# 5) CFD Görselleştirme (Demo)
+# ------------------------------------------------------------
 elif page.startswith("5"):
     st.title("5) CFD Görselleştirme (Demo)")
 
@@ -414,7 +499,7 @@ elif page.startswith("5"):
 
         st.markdown("---")
         st.caption(
-            "Not: Bu sekme gerçek CFD çözümü değil, konsept göstermek için "
+            "Not: Bu sekme **gerçek CFD çözümü** değil, konsept göstermek için "
             "hazırlanmış sentetik bir sıcaklık + hız alanı görselleştirmesidir."
         )
 
