@@ -347,10 +347,7 @@ elif page.startswith("4"):
 
             missing_cols = [c for c in feature_cols if c not in batch_df.columns]
             if missing_cols:
-                st.error(
-                    "Yüklenen dosyada aşağıdaki zorunlu kolonlar eksik:
-"
-                    + ", ".join(missing_cols)
+             st.error(f"Yüklenen dosyada aşağıdaki zorunlu kolonlar eksik: {', '.join(missing_cols)}")
                 )
             else:
                 features = batch_df[feature_cols].values
